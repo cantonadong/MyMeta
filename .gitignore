@@ -1,0 +1,8 @@
+/target/
+/data/
+/MyMeta.exe
+/web/node_modules/
+/web/dist/
+dev规范.txt
+数据血缘与元数据管理工具 需求文档.md
+开发日志.md
