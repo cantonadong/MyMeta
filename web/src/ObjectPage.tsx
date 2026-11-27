@@ -63,7 +63,7 @@ function Overview({ detail, reload }: { detail: Detail; reload: () => void }) {
   const [form, setForm] = useState<Record<string, any>>({});
   const [editing, setEditing] = useState(false);
   const [busy, setBusy] = useState(false);
-  useEffect(() => setForm(Object.fromEntries(BIZ_FIELDS.map(f => [f, biz?.[f] ?? '']))), [biz]);
+  useEffect(() => setForm(Object.fromEntries(BIZ_FIELDS.map(f => [f, biz?.[f] ?? (f === 'description' ? null : '')]))), [biz]);
   // Parsed naming values and the database comment are shown as defaults until overridden.
   const defaults: Record<string, string | null | undefined> = { product: naming.product, layer: naming.layer, grain: naming.grain, maintainer: naming.maintainer, description: object.comment, primary_key: object.props?.primary_key, date_column: detail.date_column, is_temporary: naming.temporary ? '1' : '0' };
   const save = async () => {
@@ -77,6 +77,7 @@ function Overview({ detail, reload }: { detail: Detail; reload: () => void }) {
   };
   const value = (f: string) => {
     const v = biz?.[f];
+    if (f === 'description' && v === '') return '—';
     if (v !== null && v !== undefined && v !== '') return f === 'is_temporary' ? label(String(v === 1)) : f === 'layer' ? label(v) : String(v);
     const d = defaults[f];
     if (!d) return '—';
@@ -85,7 +86,7 @@ function Overview({ detail, reload }: { detail: Detail; reload: () => void }) {
   const input = (f: string) => f === 'layer'
     ? <select value={form[f]} onChange={e => setForm({ ...form, [f]: e.target.value })}><option value="">{t('自动')}{defaults.layer ? `（${defaults.layer}）` : ''}</option>{LAYERS.map(l => <option key={l} value={l}>{label(l)}</option>)}</select>
     : f === 'is_temporary' ? <select value={String(form[f])} onChange={e => setForm({ ...form, [f]: e.target.value === '' ? '' : Number(e.target.value) })}><option value="">{t('自动')}</option><option value="1">{t('是')}</option><option value="0">{t('否')}</option></select>
-    : f === 'description' ? <textarea rows={3} value={form[f]} placeholder={defaults[f] || ''} onChange={e => setForm({ ...form, [f]: e.target.value })} />
+    : f === 'description' ? <textarea rows={3} value={form[f] ?? ''} placeholder={form[f] == null ? defaults[f] || '' : ''} onChange={e => setForm({ ...form, [f]: e.target.value })} />
     : <input value={form[f]} placeholder={f === 'date_column' ? (defaults[f] || t('未识别；填 - 表示不检查')) : defaults[f] || ''} onChange={e => setForm({ ...form, [f]: e.target.value })} />;
   const props = Object.entries(object.props || {}).filter(([k, v]) => v !== null && v !== '' && !['last_refresh', 'auto_refresh'].includes(k));
   const propValue = (key: string, v: unknown) => key === 'size_bytes' ? bytes(v) : key === 'rows' || key === 'rows_estimate' ? number(v) : typeof v === 'boolean' ? label(String(v)) : String(v);
@@ -151,7 +152,7 @@ function Columns({ detail, reload }: { detail: Detail; reload: () => void }) {
 }
 
 function ColumnModal({ column, rules, onClose, onSaved }: { column: any; rules: any[]; onClose: () => void; onSaved: () => void }) {
-  const [form, setForm] = useState({ meaning: column.meaning ?? '', unit: column.unit ?? '', currency: column.currency ?? '', timezone: column.timezone ?? '', is_sensitive: !!column.is_sensitive, notes: column.notes ?? '' });
+  const [form, setForm] = useState({ meaning: column.meaning ?? '', unit: column.unit ?? '', currency: column.currency ?? '', timezone: column.timezone ?? '', is_sensitive: !!column.is_sensitive, notes: column.notes ?? '', sample: column.sample ?? '' });
   const [busy, setBusy] = useState(false);
   const [sample, setSample] = useState<{ value: string | null; count: number; checked: boolean }[] | null>(null);
   const save = async () => {
@@ -180,6 +181,7 @@ function ColumnModal({ column, rules, onClose, onSaved }: { column: any; rules: 
       <Field label={label('timezone')}><input value={form.timezone} placeholder={t('如 UTC，按 UTC 0 点切日')} onChange={e => setForm({ ...form, timezone: e.target.value })} /></Field>
       <Field label={label('is_sensitive')}><input type="checkbox" checked={form.is_sensitive} onChange={e => setForm({ ...form, is_sensitive: e.target.checked })} /></Field>
       <Field label={label('notes')} wide><textarea rows={2} value={form.notes} onChange={e => setForm({ ...form, notes: e.target.value })} /></Field>
+      <Field label={t('示例值')} wide><textarea rows={2} value={form.sample} onChange={e => setForm({ ...form, sample: e.target.value })} /></Field>
     </div>
     <div className="card-heading"><h3>{t('字段规则')}</h3><button disabled={busy} onClick={loadSample}>{t('采样 Top 20')}</button></div>
     {sample && <div className="sample-box">
@@ -196,30 +198,47 @@ export function RuleEditor({ target, rules, onChanged, kinds }: { target: string
   const [items, setItems] = useState(rules);
   useEffect(() => setItems(rules), [rules]);
   const [form, setForm] = useState({ kind: kinds[0], value: '', condition: '', note: '' });
-  const add = async () => {
+  const [editing, setEditing] = useState<number>();
+  const [saving, setSaving] = useState(false);
+  const reset = () => { setEditing(undefined); setForm({ kind: form.kind, value: '', condition: '', note: '' }); };
+  const save = async () => {
     if (form.kind === 'filter' && !form.condition.trim()) { toast(t('必加过滤需要填写 SQL 条件')); return; }
     if ((form.kind === 'valid' || form.kind === 'invalid') && !form.value.trim() && !form.condition.trim()) { toast(t('请填写取值或 SQL 条件')); return; }
     if (form.kind === 'note' && !form.note.trim()) { toast(t('请填写说明')); return; }
-    try { const r = await post('/api/m/rule', { target_key: target, ...form }, 'PUT'); setItems([...items, { id: r.id, target_key: target, ...form }]); setForm({ ...form, value: '', condition: '', note: '' }); onChanged(); }
+    const rule = { id: editing, target_key: target, ...form };
+    setSaving(true);
+    try {
+      const { id } = await post('/api/m/rule', rule, 'PUT');
+      setItems(current => editing === undefined ? [...current, { ...rule, id }] : current.map(item => item.id === id ? { ...rule, id } : item));
+      reset();
+      onChanged();
+    }
     catch (e) { toast((e as Error).message); }
+    finally { setSaving(false); }
   };
   const remove = async (id: number) => {
-    try { await del('/api/m/rule/' + id); setItems(items.filter(r => r.id !== id)); onChanged(); } catch (e) { toast((e as Error).message); }
+    setSaving(true);
+    try { await del('/api/m/rule/' + id); setItems(current => current.filter(r => r.id !== id)); if (id === editing) reset(); onChanged(); } catch (e) { toast((e as Error).message); }
+    finally { setSaving(false); }
   };
   return <>
     <table className="reports-table rule-table">
       <thead><tr><th>{t('规则类型')}</th><th>{label('value')}</th><th>{label('condition')}</th><th>{t('说明')}</th><th>{t('操作')}</th></tr></thead>
       <tbody>
         <TableState columns={5} loading={false} empty={!items.length} />
-        {items.map(r => <tr key={r.id}><td>{label(r.kind)}</td><td title={r.value || ''}>{r.value}</td><td title={r.condition || ''}><code>{r.condition}</code></td><td title={r.note || ''}>{r.note}</td><td><div className="report-actions"><button className="report-delete" onClick={() => remove(r.id)}>{t('删除')}</button></div></td></tr>)}
+        {items.map(r => <tr key={r.id}><td>{label(r.kind)}</td><td title={r.value || ''}>{r.value}</td><td title={r.condition || ''}><code>{r.condition}</code></td><td title={r.note || ''}>{r.note}</td><td><div className="report-actions"><button disabled={saving} onClick={() => { setEditing(r.id); setForm({ kind: r.kind, value: r.value ?? '', condition: r.condition ?? '', note: r.note ?? '' }); }}>{t('编辑')}</button><button disabled={saving} className="report-delete" onClick={() => remove(r.id)}>{t('删除')}</button></div></td></tr>)}
       </tbody>
     </table>
     <div className="rule-form">
-      <select value={form.kind} onChange={e => setForm({ ...form, kind: e.target.value })}>{kinds.map(k => <option key={k} value={k}>{label(k)}</option>)}</select>
-      {form.kind !== 'note' && form.kind !== 'filter' && <input value={form.value} placeholder={label('value')} onChange={e => setForm({ ...form, value: e.target.value })} />}
-      {form.kind !== 'note' && <input value={form.condition} placeholder={form.kind === 'filter' ? t('如 is_test = 0') : t('SQL 条件（可选）')} onChange={e => setForm({ ...form, condition: e.target.value })} />}
-      <input className="rule-note" value={form.note} placeholder={form.kind === 'filter' ? t('适用场景') : form.kind === 'invalid' ? t('原因') : t('说明')} onChange={e => setForm({ ...form, note: e.target.value })} />
-      <button onClick={add}>{t('添加')}</button>
+      <select disabled={saving} value={form.kind} onChange={e => {
+        const kind = e.target.value;
+        setForm({ ...form, kind, value: kind === 'note' || kind === 'filter' ? '' : form.value, condition: kind === 'note' ? '' : form.condition });
+      }}>{kinds.map(k => <option key={k} value={k}>{label(k)}</option>)}</select>
+      {form.kind !== 'note' && form.kind !== 'filter' && <input disabled={saving} value={form.value} placeholder={label('value')} onChange={e => setForm({ ...form, value: e.target.value })} />}
+      {form.kind !== 'note' && <input disabled={saving} value={form.condition} placeholder={form.kind === 'filter' ? t('如 is_test = 0') : t('SQL 条件（可选）')} onChange={e => setForm({ ...form, condition: e.target.value })} />}
+      <input disabled={saving} className="rule-note" value={form.note} placeholder={form.kind === 'filter' ? t('适用场景') : form.kind === 'invalid' ? t('原因') : t('说明')} onChange={e => setForm({ ...form, note: e.target.value })} />
+      {editing !== undefined && <button disabled={saving} onClick={reset}>{t('取消')}</button>}
+      <button disabled={saving} onClick={save}>{t(editing === undefined ? '添加' : '保存')}</button>
     </div>
   </>;
 }

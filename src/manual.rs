@@ -17,7 +17,7 @@ pub struct Spec {
 
 pub const SPECS: &[Spec] = &[
     Spec { table: "object_biz", pk: "key", columns: &["cn_name", "description", "product", "layer", "grain", "primary_key", "source_tables", "refresh_method", "maintainer", "is_temporary", "date_column"], log_key: "key", required: &[] },
-    Spec { table: "column_biz", pk: "key", columns: &["meaning", "unit", "currency", "timezone", "is_sensitive", "notes"], log_key: "key", required: &[] },
+    Spec { table: "column_biz", pk: "key", columns: &["meaning", "unit", "currency", "timezone", "is_sensitive", "notes", "sample"], log_key: "key", required: &[] },
     Spec { table: "rule", pk: "id", columns: &["target_key", "kind", "value", "condition", "note"], log_key: "target_key", required: &["target_key", "kind"] },
     Spec { table: "relation", pk: "id", columns: &["left_key", "right_key", "key_pairs", "kind", "note", "diff_note", "status", "origin"], log_key: "left_key", required: &["left_key", "right_key", "key_pairs"] },
     Spec { table: "flow_step", pk: "id", columns: &["product", "flow", "step_no", "name", "object_key", "columns", "note"], log_key: "flow", required: &["product", "flow", "step_no", "name"] },
@@ -51,7 +51,14 @@ pub fn log(db: &Connection, entity: &str, key: &str, field: &str, before: Option
 /// Inserts or updates one row and logs every changed field. Returns the row's primary key.
 pub fn upsert(db: &Connection, spec: &Spec, body: &Map<String, Value>) -> Result<Value, String> {
     let pk_value = body.get(spec.pk).filter(|v| !v.is_null() && v.as_str() != Some(""));
-    let values: Vec<(&str, SqlValue)> = spec.columns.iter().filter(|c| body.contains_key(**c)).map(|c| (*c, to_sql(&body[*c]))).collect();
+    let values: Vec<(&str, SqlValue)> = spec.columns.iter().filter(|c| body.contains_key(**c)).map(|&column| {
+        let value = &body[column];
+        let value = if spec.table == "object_biz" && column == "description" && value.as_str() == Some("") {
+            // Explicitly cleared directory comment. NULL still inherits the database comment.
+            SqlValue::Text(String::new())
+        } else { to_sql(value) };
+        (column, value)
+    }).collect();
     let old: Option<HashMap<String, SqlValue>> = match pk_value {
         Some(pk) => {
             let mut stmt = db.prepare(&format!("SELECT * FROM {} WHERE {} = ?", spec.table, spec.pk)).map_err(|e| e.to_string())?;

@@ -1,7 +1,7 @@
 // UI preview data: open the page with ?mock (normal), ?mock=empty or ?mock=error. Responses are delayed to show loading states.
 const now = '2026-11-23T02:00:00Z';
 const run = (id: number, scope: string, extra: object = {}) => ({ id, scope, trigger: 'schedule', started_at: '2026-11-23T01:59:48Z', finished_at: now, status: 'ok', error: null, baseline: 0, summary: { objects: 2203, columns: 16707, added_objects: 1, deleted_objects: 1, added_columns: 2, deleted_columns: 0, changes: 5, warnings: [] }, ...extra });
-const objects = [
+const objects: { key: string; scope: string; name: string; kind: string; comment: string | null; props: Record<string, unknown>; is_deleted: number; synced_at: string; column_count: number }[] = [
   { key: 'proddb.public.btd6mobile_cd_fct_iap_daily', scope: 'proddb.public', name: 'btd6mobile_cd_fct_iap_daily', kind: 'table', comment: 'BTD6 每日 IAP 收入（USD）', props: { diststyle: 'KEY(event_date)', sortkey: 'event_date', rows: 1830211, size_bytes: 412090368, encoded: 'Y' }, is_deleted: 0, synced_at: now, column_count: 14 },
   { key: 'proddb.public.btd6mobile_cd_topic_paragon_unlock_daily_mv', scope: 'proddb.public', name: 'btd6mobile_cd_topic_paragon_unlock_daily_mv', kind: 'mv', comment: null, props: { mv_state: '1', auto_refresh: false, last_refresh: '2026-11-22 18:00:03' }, is_deleted: 0, synced_at: now, column_count: 6 },
   { key: 'nkreportr.public.steam_freeapp_downloads_bycountry', scope: 'nkreportr.public', name: 'steam_freeapp_downloads_bycountry', kind: 'table', comment: null, props: { rows_estimate: 64917, size_bytes: 14229504, primary_key: 'date,name,country' }, is_deleted: 0, synced_at: now, column_count: 9 },
@@ -13,6 +13,17 @@ const columns = [
   { key: 'proddb.public.btd6mobile_cd_fct_iap_daily.event_date', name: 'event_date', data_type: 'date', nullable: 0, comment: null, is_deleted: 0, ordinal: 1, props: { encoding: 'az64', distkey: true, sortkey: '1' }, object_key: objects[0].key, object_name: objects[0].name, scope: 'proddb.public', kind: 'table' },
   { key: 'proddb.public.btd6mobile_cd_fct_iap_daily.old_flag', name: 'old_flag', data_type: 'boolean', nullable: 1, comment: null, is_deleted: 1, ordinal: 9, props: {}, object_key: objects[0].key, object_name: objects[0].name, scope: 'proddb.public', kind: 'table' },
 ];
+for (let i = 1; i <= 20; i++) {
+  const name = 'btd6mobile_cd_dtl_event_' + String(i).padStart(2, '0');
+  const key = 'proddb.public.' + name;
+  objects.push({ ...objects[0], key, name, comment: '事件明细', props: {}, column_count: 1 });
+  columns.push({ ...columns[0], key: key + '.country', object_key: key, object_name: name });
+}
+const objectBiz = new Map<string, Record<string, any>>([[objects[0].key, { cn_name: 'BTD6 每日 IAP 收入' }]]);
+const columnBiz = new Map<string, Record<string, any>>([[columns[0].key, { meaning: '用户所在国家', sample: 'GB' }]]);
+const sampledTables = new Set<string>();
+let catalogRules = [{ id: 1, target_key: objects[0].key, kind: 'filter', condition: 'is_test = 0', note: '所有报表' }, { id: 2, target_key: columns[0].key, kind: 'invalid', value: 'XX', note: '未知国家' }, { id: 3, target_key: columns[0].key, kind: 'valid', value: 'US', note: '美国' }];
+let nextRuleId = 4;
 const changes = [
   { id: 5, entity: 'column', key: 'proddb.public.btd6mobile_cd_fct_iap_daily.country', field: 'data_type', before: 'character varying(2)', after: 'character varying(8)', source: 'sync', actor: 'sync', at: now, run_id: 7 },
   { id: 4, entity: 'column', key: 'proddb.public.btd6mobile_cd_fct_iap_daily.old_flag', field: 'status', before: 'present', after: 'deleted', source: 'sync', actor: 'sync', at: now, run_id: 7 },
@@ -37,7 +48,7 @@ const graphEdges = [[1, 0], [2, 0], [0, 3], [3, 4]].map(([a, b]) => ({ from: gra
 const relations = [{ id: 1, left_key: objects[0].key, right_key: objects[2].key, key_pairs: [[objects[0].key + '.country', objects[2].key + '.country']], kind: 'n:n', note: '按国家对照收入与下载', diff_note: 'proddb 为 ISO2，nkreportr 为 Steam 国家名', status: 'confirmed', left_name: objects[0].name, right_name: objects[2].name, cross_db: 1 }];
 const metrics = [{ id: 1, name_cn: 'D1 留存率', name_en: 'D1 retention', definition: '某日新增用户中，第 1 天（次日）再次活跃的比例', formula: 'D1 活跃新增用户数 / 当日新增用户数', numerator: '第 1 天仍活跃的当日新增用户数', denominator: '当日新增用户数', object_key: objects[1].key, column_name: 'unlock_users', used_by: ['mybi:dataset:1'], builtin: 1 }];
 const steps = [['安装', 'btd6mobile_installs'], ['首次启动', 'btd6mobile_sessions'], ['关卡', 'btd6mobile_starttrack'], ['付费', objects[0].name]].map(([name, table], i) => ({ id: i + 1, product: 'BTD6', flow: '新手流程', step_no: i + 1, name, object_key: 'proddb.public.' + table, columns: 'userid, created_at', note: '' }));
-const settings = { scopes: [{ profile: 'ProdDB', schema: 'public' }, { profile: 'NKReportR', schema: 'public' }], sync_interval_minutes: 60, rename_threshold: 0.8, freshness_time: '03:00', mybi_path: 'C:\\Program\\MyBI\\data-workbench.db',
+const settings = { scopes: [{ profile: 'ProdDB', schema: 'public' }, { profile: 'NKReportR', schema: 'public' }] as { profile: string; schema: string; display_name?: string }[], sync_interval_minutes: 60, rename_threshold: 0.8, freshness_time: '03:00', mybi_path: 'C:\\Program\\MyBI\\data-workbench.db',
   naming: { products: { btd6mobile: 'BTD6', blitzmobile: 'Blitz', zamobile: 'ZAR' }, maintainers: { cd: 'Carl Dong' }, layer_synonyms: { detail: 'dtl', topic: 'tpc' }, grains: ['daily', 'weekly', 'monthly', 'latest'], grain_synonyms: { d: 'daily' } },
   script_folders: [{ path: 'C:\\etl\\sql', database: 'proddb', schema: 'public' }],
   cleanup: { enabled: true, pattern: '^[a-z0-9]+_cd_tmp_[a-z0-9_]+_(\\d{8})(_mv)?$', days: 1, time: '02:00', confirmed: null, effective: false } };
@@ -48,24 +59,96 @@ export async function mockApi(path: string, init: RequestInit | undefined, mode:
   const empty = mode === 'empty';
   const [route, query = ''] = path.split('?');
   const params = new URLSearchParams(query);
+  const catalog = route === '/api/objects' || route === '/api/columns';
+  const body: string[] | { order?: string[]; hidden?: string[]; bottom?: string[] } = catalog && init?.method === 'POST' ? JSON.parse(String(init.body)) : {};
+  const hidden = new Set(Array.isArray(body) ? [] : body.hidden ?? []);
+  const search = [...JSON.parse(params.get('terms') || '[]') as string[], params.get('q') || '']
+    .flatMap(term => term.toLowerCase().split(/\s+/)).filter(Boolean);
+  const matches = (row: { name: string }) => search.every(term => row.name.toLowerCase().includes(term));
+  const catalogPage = <T extends { scope: string; kind: string; key: string; name: string; comment: string | null; object_key?: string }>(rows: T[]) => {
+    const filtered = empty ? [] : rows.filter(row =>
+      (!params.get('scope') || row.scope === params.get('scope')) &&
+      (!params.get('kind') || row.kind === params.get('kind')) && !hidden.has(row.object_key ?? row.key) && matches(row));
+    const offset = Number(params.get('page') || 0) * 10;
+    return { total: filtered.length, rows: filtered.slice(offset, offset + 10) };
+  };
+  if (init?.method === 'PUT' && (route === '/api/m/object_biz' || route === '/api/m/column_biz')) {
+    const { key, ...values } = JSON.parse(String(init.body));
+    const map = route.endsWith('object_biz') ? objectBiz : columnBiz;
+    map.set(key, { ...map.get(key), ...Object.fromEntries(Object.entries(values).map(([field, value]) => [
+      field, typeof value === 'string' && !value.trim() && !(route.endsWith('object_biz') && field === 'description' && value === '') ? null : value,
+    ])) });
+    return { key };
+  }
+  if (init?.method === 'PUT' && route === '/api/m/rule') {
+    const rule = JSON.parse(String(init.body));
+    const id = rule.id ?? nextRuleId++;
+    catalogRules = [...catalogRules.filter(item => item.id !== id), { ...rule, id }];
+    return { id };
+  }
+  if (init?.method === 'DELETE' && route.startsWith('/api/m/rule/')) {
+    catalogRules = catalogRules.filter(rule => rule.id !== Number(route.split('/').pop()));
+    return { ok: true };
+  }
   if (route === '/api/sample') return [{ value: 'US', count: 120345 }, { value: 'GB', count: 40211 }, { value: null, count: 12 }];
+  if (route === '/api/table-samples') {
+    const { key, skip_recent } = JSON.parse(String(init?.body));
+    if (skip_recent && sampledTables.has(key)) return { updated: 0, skipped: true };
+    const fields = columns.filter(column => column.object_key === key && !column.is_deleted && !columnBiz.get(column.key)?.is_sensitive);
+    let updated = 0;
+    for (const column of fields) {
+      const sample = column.name === 'event_date' ? now.slice(0, 10) : 'US';
+      if (columnBiz.get(column.key)?.sample === sample) continue;
+      columnBiz.set(column.key, { ...columnBiz.get(column.key), sample });
+      updated++;
+    }
+    if (fields.length) sampledTables.add(key);
+    return { updated };
+  }
   if (route === '/api/lineage/rebuild') return { views: 359, scripts: 1, parse_errors: 0 };
-  if (init?.method && init.method !== 'GET') return route === '/api/sync' ? [run(9, 'proddb.public', { trigger: 'manual' }), run(10, 'nkreportr.public', { trigger: 'manual', status: 'error', error: 'timeout expired', summary: null })] : { ok: true };
+  if (route === '/api/settings' && init?.method === 'PUT') {
+    const body = JSON.parse(String(init.body));
+    if (body.scopes) settings.scopes = body.scopes;
+    return settings;
+  }
+  if (init?.method && init.method !== 'GET' && !catalog) return route === '/api/sync' ? [run(9, 'proddb.public', { trigger: 'manual' }), run(10, 'nkreportr.public', { trigger: 'manual', status: 'error', error: 'timeout expired', summary: null })] : { ok: true };
   switch (route) {
     case '/api/connections': return [{ name: 'ProdDB', redshift: true, database: 'proddb' }, { name: 'NKReportR', redshift: false, database: 'nkreportr' }];
     case '/api/settings': return empty ? { ...settings, scopes: [], script_folders: [] } : settings;
     case '/api/sync/status': return { running: false, interval_minutes: 60, scopes: empty ? [] : [
       { profile: 'ProdDB', schema: 'public', label: 'proddb.public', connection_found: true, last_run: run(7, 'proddb.public'), counts: { objects: 2203, columns: 16707 } },
       { profile: 'NKReportR', schema: 'public', label: 'nkreportr.public', connection_found: true, last_run: run(8, 'nkreportr.public', { status: 'error', error: 'password authentication failed for user "nkreportr"', summary: null }), counts: { objects: 158, columns: 1235 } },
-    ] };
+    ].map(scope => ({ ...scope, display_name: settings.scopes.find(item => item.profile === scope.profile && item.schema === scope.schema)?.display_name })) };
     case '/api/sync/runs': return page(empty ? [] : [run(8, 'nkreportr.public', { status: 'error', error: 'password authentication failed', summary: null }), run(7, 'proddb.public'), run(2, 'nkreportr.public', { trigger: 'startup', baseline: 1 }), run(1, 'proddb.public', { trigger: 'startup', baseline: 1 })]);
-    case '/api/objects': return page(empty ? [] : objects.filter(o => (params.get('tmp') === 'true' || !o.name.includes('_cd_tmp_')) && (params.get('deleted') === 'true' || !o.is_deleted)));
-    case '/api/columns': return page(empty ? [] : columns.filter(c => params.get('deleted') === 'true' || !c.is_deleted));
+    case '/api/objects': {
+      const rows = objects.filter(o => (params.get('tmp') === 'true' || !o.name.includes('_cd_tmp_')) && (params.get('deleted') === 'true' || !o.is_deleted));
+      const sort = params.get('sort');
+      if (sort) {
+        const rank = (row: typeof rows[number]) => sort === 'columns-desc' ? row.column_count
+          : sort === 'rows-desc' ? Number(row.props.rows ?? row.props.rows_estimate ?? -1)
+          : sort === 'size-desc' ? Number(row.props.size_bytes ?? -1) : 0;
+        rows.sort((a, b) => rank(b) - rank(a) || (sort === 'name-desc' ? b.name.localeCompare(a.name) : a.name.localeCompare(b.name)));
+      }
+      const order = Array.isArray(body) ? body : body.order ?? [];
+      if (order.length) {
+        const ranks = new Map(order.map((key, index) => [key, index]));
+        rows.sort((a, b) => (ranks.get(a.key) ?? order.length) - (ranks.get(b.key) ?? order.length));
+      }
+      const bottom = Array.isArray(body) ? [] : body.bottom ?? [];
+      if (bottom.length) {
+        const ranks = new Map(bottom.map((key, index) => [key, index]));
+        rows.sort((a, b) => (ranks.get(a.key) ?? -1) - (ranks.get(b.key) ?? -1));
+      }
+      return catalogPage(rows.map(o => ({ ...o, ...objectBiz.get(o.key) })));
+    }
+    case '/api/columns': return catalogPage(columns.filter(c => params.get('deleted') === 'true' || !c.is_deleted).map(c => ({ ...c, ...columnBiz.get(c.key) })));
     case '/api/object': {
       const object = objects.find(o => o.key === params.get('key')) || objects[0];
       return { object: { ...object, naming, first_seen: '2026-11-22T20:44:44Z', definition: object.kind === 'mv' ? 'CREATE MATERIALIZED VIEW btd6mobile_cd_topic_paragon_unlock_daily_mv\nAUTO REFRESH NO AS\nSELECT event_date, paragon, COUNT(*) AS unlocks\nFROM btd6mobile_cd_dtl_paragon_unlock\nGROUP BY 1, 2;' : null },
-        biz: empty ? null : { key: object.key, cn_name: 'BTD6 每日 IAP 收入', description: null, layer: null }, columns: empty ? [] : columns.filter(c => c.object_key === object.key).map(c => ({ ...c, meaning: c.name === 'country' ? '用户所在国家' : null, rule_count: c.name === 'country' ? 2 : 0 })),
-        rules: empty ? [] : [{ id: 1, target_key: object.key, kind: 'filter', condition: 'is_test = 0', note: '所有报表' }, { id: 2, target_key: object.key + '.country', kind: 'invalid', value: 'XX', note: '未知国家' }, { id: 3, target_key: object.key + '.country', kind: 'valid', value: 'US', note: '美国' }],
+        biz: empty ? null : objectBiz.get(object.key), columns: empty ? [] : columns
+          .filter(c => c.object_key === object.key && (!search.length || !c.is_deleted && matches(c)))
+          .sort((a, b) => a.ordinal - b.ordinal).map(c => ({ ...c, ...columnBiz.get(c.key), rule_count: catalogRules.filter(r => r.target_key === c.key).length })),
+        rules: empty ? [] : catalogRules.filter(r => r.target_key === object.key || r.target_key.startsWith(object.key + '.')),
         freshness: { date_column: 'event_date', max_date: '2026-11-20', expected: '2026-11-22', delayed: 1, checked_at: now }, date_column: 'event_date',
         refreshed_by: empty ? [] : [{ source: 'script', origin: 'C:\\etl\\sql\\btd6_iap.sql', name: null }], counts: { upstream: 2, downstream: 3, relations: 1 } };
     }

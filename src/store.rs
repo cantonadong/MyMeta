@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS object_biz (
   key TEXT PRIMARY KEY, cn_name TEXT, description TEXT, product TEXT, layer TEXT, grain TEXT, primary_key TEXT,
   source_tables TEXT, refresh_method TEXT, maintainer TEXT, is_temporary INTEGER, date_column TEXT, updated_at TEXT);
 CREATE TABLE IF NOT EXISTS column_biz (
-  key TEXT PRIMARY KEY, meaning TEXT, unit TEXT, currency TEXT, timezone TEXT, is_sensitive INTEGER, notes TEXT, updated_at TEXT);
+  key TEXT PRIMARY KEY, meaning TEXT, unit TEXT, currency TEXT, timezone TEXT, is_sensitive INTEGER, notes TEXT, sample TEXT, updated_at TEXT);
 CREATE TABLE IF NOT EXISTS rule (
   id INTEGER PRIMARY KEY, target_key TEXT NOT NULL, kind TEXT NOT NULL, value TEXT, condition TEXT, note TEXT, updated_at TEXT);
 CREATE INDEX IF NOT EXISTS rule_target ON rule(target_key);
@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS metric (
   object_key TEXT, column_name TEXT, used_by TEXT, builtin INTEGER NOT NULL DEFAULT 0, updated_at TEXT);
 -- Derived data (rebuilt by jobs / parsers).
 CREATE TABLE IF NOT EXISTS freshness (key TEXT PRIMARY KEY, date_column TEXT, max_date TEXT, checked_at TEXT, error TEXT);
+CREATE TABLE IF NOT EXISTS table_sample_read (key TEXT PRIMARY KEY, read_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS lineage (
   id INTEGER PRIMARY KEY, source TEXT NOT NULL, origin TEXT NOT NULL, upstream TEXT NOT NULL, downstream TEXT NOT NULL,
   upstream_column TEXT, downstream_column TEXT, expression TEXT, parsed_at TEXT NOT NULL);
@@ -67,7 +68,7 @@ pub fn open(path: &Path) -> Result<Connection, String> {
     let db = Connection::open(path).map_err(|e| e.to_string())?;
     db.execute_batch(&format!("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; {SCHEMA}")).map_err(|e| e.to_string())?;
     // Columns added after M1: (table, column, type)
-    for (table, column, kind) in [("object_tech", "naming", "TEXT NOT NULL DEFAULT '{}'")] {
+    for (table, column, kind) in [("object_tech", "naming", "TEXT NOT NULL DEFAULT '{}'"), ("column_biz", "sample", "TEXT")] {
         let exists: bool = db.query_row(&format!("SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name = '{column}')"), [], |r| r.get(0)).map_err(|e| e.to_string())?;
         if !exists { db.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind}")).map_err(|e| e.to_string())?; }
     }

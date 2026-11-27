@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
+
 mod api;
 mod biz;
 mod catalog;
@@ -10,6 +12,8 @@ mod secrets;
 mod store;
 mod sync;
 mod transfer;
+#[cfg(windows)]
+mod tray;
 
 use axum::{http::{StatusCode, Uri, header}, response::{IntoResponse, Response}};
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -17,6 +21,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 pub struct AppState {
     pub db: store::Db,
     pub sync_lock: tokio::sync::Mutex<()>,
+    pub sample_lock: tokio::sync::RwLock<()>,
     pub schedule_changed: tokio::sync::Notify,
     pub data_dir: PathBuf,
 }
@@ -50,17 +55,20 @@ fn port(dir: &std::path::Path) -> u16 {
 
 fn open_browser(url: &str) {
     #[cfg(windows)]
-    let _ = std::process::Command::new("cmd").args(["/C", "start", "", url]).spawn();
+    tray::open_browser(url);
     #[cfg(not(windows))]
     let _ = url;
 }
 
 fn main() {
     // SQL parsing of large view definitions recurses deeply; the default 2 MB worker stack is not enough.
-    tokio::runtime::Builder::new_multi_thread().enable_all().thread_stack_size(32 << 20).build().expect("tokio runtime").block_on(run());
+    let restart = tokio::runtime::Builder::new_multi_thread().enable_all().thread_stack_size(32 << 20).build().expect("tokio runtime").block_on(run());
+    if restart && let Err(error) = std::env::current_exe().and_then(|exe| std::process::Command::new(exe).arg("--no-browser").spawn()) {
+        eprintln!("MyMeta could not restart: {error}");
+    }
 }
 
-async fn run() {
+async fn run() -> bool {
     let dir = data_dir();
     let port = port(&dir);
     let url = format!("http://127.0.0.1:{port}/");
@@ -70,7 +78,7 @@ async fn run() {
         Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
             println!("MyMeta 已在运行：{url}");
             if browser { open_browser(&url); }
-            return;
+            return false;
         }
         Err(error) => panic!("监听 {url} 失败：{error}"),
     };
@@ -78,7 +86,7 @@ async fn run() {
     db.execute("UPDATE sync_run SET status = 'error', error = 'interrupted' WHERE status = 'running'", []).ok();
     transfer::seed_metrics(&db);
     naming::refresh(&db, None).ok();
-    let state = Arc::new(AppState { db: db.into(), sync_lock: Default::default(), schedule_changed: Default::default(), data_dir: dir.clone() });
+    let state = Arc::new(AppState { db: db.into(), sync_lock: Default::default(), sample_lock: Default::default(), schedule_changed: Default::default(), data_dir: dir.clone() });
     tokio::spawn(jobs::scheduler(state.clone()));
 
     let scheduler = state.clone();
@@ -101,8 +109,30 @@ async fn run() {
         }
     });
 
-    println!("MyMeta 运行中：{url}（关闭此窗口即停止服务）");
+    #[cfg(windows)]
+    let mut tray_actions = tray::start(url.clone(), state.clone());
+    println!("MyMeta 运行中：{url}");
     if browser { open_browser(&url); }
     let app = api::router().fallback(assets).layer(axum::extract::DefaultBodyLimit::max(64 << 20)).with_state(state);
-    axum::serve(listener, app).await.expect("serve");
+    let server = axum::serve(listener, app);
+    #[cfg(windows)]
+    {
+        use std::future::IntoFuture;
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let server = server.with_graceful_shutdown(async { let _ = stopped.await; }).into_future();
+        tokio::pin!(server);
+        return tokio::select! {
+            result = &mut server => { result.expect("serve"); false }
+            action = tray_actions.recv() => {
+                let _ = stop.send(());
+                let _ = tokio::time::timeout(Duration::from_secs(3), &mut server).await;
+                matches!(action, Some(tray::Action::Restart))
+            }
+        };
+    }
+    #[cfg(not(windows))]
+    {
+        server.await.expect("serve");
+        false
+    }
 }

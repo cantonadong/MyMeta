@@ -61,7 +61,7 @@ pub async fn import_json(State(s): St, Json(body): Json<Value>) -> ApiResult {
 
 // Excel layout: sheet name, query, (header, column) pairs. The first column is the business key used on import.
 const OBJECT_COLUMNS: [(&str, &str); 14] = [("业务键", "key"), ("类型", "kind"), ("数据库注释", "comment"), ("中文名", "cn_name"), ("用途说明", "description"), ("产品", "product"), ("层级", "layer"), ("粒度", "grain"), ("主键/业务键", "primary_key"), ("来源表", "source_tables"), ("刷新方式", "refresh_method"), ("维护人", "maintainer"), ("是否临时对象", "is_temporary"), ("日期字段", "date_column")];
-const COLUMN_COLUMNS: [(&str, &str); 10] = [("业务键", "key"), ("字段类型", "data_type"), ("数据库注释", "comment"), ("业务含义", "meaning"), ("单位", "unit"), ("币种", "currency"), ("时区与切日", "timezone"), ("是否敏感", "is_sensitive"), ("注意事项", "notes"), ("所在对象", "object_key")];
+const COLUMN_COLUMNS: [(&str, &str); 11] = [("业务键", "key"), ("字段类型", "data_type"), ("数据库注释", "comment"), ("业务含义", "meaning"), ("单位", "unit"), ("币种", "currency"), ("时区与切日", "timezone"), ("是否敏感", "is_sensitive"), ("注意事项", "notes"), ("所在对象", "object_key"), ("示例值", "sample")];
 const RULE_COLUMNS: [(&str, &str); 6] = [("ID", "id"), ("目标（对象或字段）", "target_key"), ("规则类型", "kind"), ("取值", "value"), ("SQL 条件", "condition"), ("说明", "note")];
 const READ_ONLY: [&str; 4] = ["kind", "comment", "data_type", "object_key"];
 
@@ -71,7 +71,7 @@ pub async fn export_xlsx(State(s): St) -> Result<Response, (StatusCode, String)>
     let bold = rust_xlsxwriter::Format::new().set_bold();
     let sheets: [(&str, &[(&str, &str)], &str); 3] = [
         ("对象", &OBJECT_COLUMNS, "SELECT o.key, o.kind, o.comment, b.cn_name, b.description, b.product, b.layer, b.grain, b.primary_key, b.source_tables, b.refresh_method, b.maintainer, b.is_temporary, b.date_column FROM object_tech o LEFT JOIN object_biz b ON b.key = o.key WHERE o.is_deleted = 0 ORDER BY o.key"),
-        ("字段", &COLUMN_COLUMNS, "SELECT c.key, c.data_type, c.comment, b.meaning, b.unit, b.currency, b.timezone, b.is_sensitive, b.notes, c.object_key FROM column_tech c JOIN object_tech o ON o.key = c.object_key LEFT JOIN column_biz b ON b.key = c.key WHERE c.is_deleted = 0 AND o.is_deleted = 0 ORDER BY c.object_key, c.ordinal"),
+        ("字段", &COLUMN_COLUMNS, "SELECT c.key, c.data_type, c.comment, b.meaning, b.unit, b.currency, b.timezone, b.is_sensitive, b.notes, c.object_key, b.sample FROM column_tech c JOIN object_tech o ON o.key = c.object_key LEFT JOIN column_biz b ON b.key = c.key WHERE c.is_deleted = 0 AND o.is_deleted = 0 ORDER BY c.object_key, c.ordinal"),
         ("规则", &RULE_COLUMNS, "SELECT id, target_key, kind, value, condition, note FROM rule ORDER BY target_key, id"),
     ];
     for (name, columns, sql) in sheets {

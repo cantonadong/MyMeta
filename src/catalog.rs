@@ -109,6 +109,7 @@ async fn redshift_catalog(client: &Client, schema: &str) -> Result<Catalog, Stri
         };
         let name = text(&row, 1);
         let mut props = Map::new();
+        props.insert("redshift".into(), json!(true));
         if let Some(def) = encodings.get(&(table.clone(), name.clone())) {
             props.insert("encoding".into(), json!(text(def, 2)));
             if def[3].as_deref().is_some_and(|v| v == "t" || v == "true") { props.insert("distkey".into(), json!(true)); }
@@ -139,8 +140,9 @@ async fn postgres_catalog(client: &Client, schema: &str) -> Result<Catalog, Stri
         if let Some(&i) = index.get(&text(&row, 0)) { objects[i].props.insert("indexes".into(), json!(row[1])); }
     }
     let mut columns = Vec::new();
-    for row in rows(client, &format!("SELECT c.relname, a.attname, a.attnum, format_type(a.atttypid, a.atttypmod), NOT a.attnotnull, col_description(c.oid, a.attnum) FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid = a.attrelid JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = {s} AND c.relkind IN ('r','p','v','m','f') AND a.attnum > 0 AND NOT a.attisdropped")).await? {
-        columns.push(Column { table: text(&row, 0), name: text(&row, 1), ordinal: text(&row, 2).parse().unwrap_or(0), data_type: text(&row, 3), nullable: text(&row, 4) == "t", comment: non_empty(&row[5]), props: Map::new() });
+    for row in rows(client, &format!("SELECT c.relname, a.attname, a.attnum, format_type(a.atttypid, a.atttypmod), NOT a.attnotnull, col_description(c.oid, a.attnum), t.typlen FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid = a.attrelid JOIN pg_catalog.pg_type t ON t.oid = a.atttypid JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = {s} AND c.relkind IN ('r','p','v','m','f') AND a.attnum > 0 AND NOT a.attisdropped")).await? {
+        let props = Map::from_iter([("type_bytes".into(), num(&row, 6))]);
+        columns.push(Column { table: text(&row, 0), name: text(&row, 1), ordinal: text(&row, 2).parse().unwrap_or(0), data_type: text(&row, 3), nullable: text(&row, 4) == "t", comment: non_empty(&row[5]), props });
     }
     Ok(Catalog { objects, columns, warnings })
 }

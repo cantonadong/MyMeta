@@ -2,6 +2,20 @@ import { getLocale, t } from './i18n';
 
 export const utc = (value?: string | null) => value ? value.replace('T', ' ').replace(/:\d\dZ$/, '') + ' UTC' : '—';
 export const number = (value: unknown) => typeof value === 'number' && value >= 0 ? value.toLocaleString(getLocale()) : '—';
+const fixedTypeBytes: Record<string, number> = {
+  smallint: 2, int2: 2, integer: 4, int: 4, int4: 4, bigint: 8, int8: 8, real: 4, float4: 4,
+  'double precision': 8, float8: 8, float: 8, boolean: 1, bool: 1, date: 4, time: 8,
+  'time without time zone': 8, timetz: 8, 'time with time zone': 8,
+};
+export function columnType(type: string, props?: { type_bytes?: number | null; redshift?: boolean }) {
+  if (/^timestamp(?:$|[ (])|^timestamptz$/i.test(type)) return 'timestamp';
+  const name = props?.redshift
+    ? type.replace(/^(?:character varying|nvarchar)(?=\()/i, 'varchar').replace(/^(?:character|nchar|bpchar)(?=\()/i, 'char')
+    : type.replace(/^character varying(?=$|\()/i, 'varchar');
+  if (name.includes('(')) return name;
+  const length = props?.type_bytes === undefined ? fixedTypeBytes[type.toLowerCase()] : props.type_bytes;
+  return `${name === 'integer' ? 'int' : name}(${typeof length === 'number' && length > 0 ? length : 'variable'})`;
+}
 export function bytes(value: unknown) {
   if (typeof value !== 'number' || value < 0) return '—';
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];

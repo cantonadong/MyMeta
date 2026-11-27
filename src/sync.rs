@@ -5,13 +5,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 
-#[derive(Clone, Deserialize, Serialize, PartialEq)]
-pub struct Scope { pub profile: String, pub schema: String }
+#[derive(Clone, Deserialize, Serialize)]
+pub struct Scope {
+    pub profile: String,
+    pub schema: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+}
 
 /// Configured scopes; defaults to MyQuery's browser scopes until the user saves their own.
 pub fn scopes(db: &Connection) -> Vec<Scope> {
     if let Some(saved) = store::setting(db, "scopes").and_then(|v| serde_json::from_value(v).ok()) { return saved; }
-    myquery_core::config::load().map(|s| s.browser_scopes.into_iter().map(|b| Scope { profile: b.profile, schema: b.schema }).collect()).unwrap_or_default()
+    myquery_core::config::load().map(|s| s.browser_scopes.into_iter().map(|b| Scope { profile: b.profile, schema: b.schema, display_name: None }).collect()).unwrap_or_default()
 }
 
 pub fn interval_minutes(db: &Connection) -> u64 {
@@ -38,7 +43,8 @@ pub async fn connect_key(state: &AppState, key: &str) -> Result<(myquery_core::d
 /// Syncs all scopes (or one). Runs one at a time; a second request waits for the first.
 pub async fn run(state: &AppState, only: Option<Scope>, trigger: &str) -> Vec<i64> {
     let _guard = state.sync_lock.lock().await;
-    let targets: Vec<Scope> = { let db = state.db.lock().unwrap(); scopes(&db) }.into_iter().filter(|s| only.as_ref().is_none_or(|o| o == s)).collect();
+    let targets: Vec<Scope> = { let db = state.db.lock().unwrap(); scopes(&db) }.into_iter()
+        .filter(|s| only.as_ref().is_none_or(|o| o.profile == s.profile && o.schema == s.schema)).collect();
     let mut ids = Vec::new();
     for scope in targets {
         let profile = myquery_core::config::load().ok().and_then(|s| s.profiles.into_iter().find(|p| p.name == scope.profile));

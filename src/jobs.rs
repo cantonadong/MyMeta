@@ -81,7 +81,7 @@ pub async fn cleanup(state: &AppState, manual_run: bool) -> Result<Value, String
         scopes.insert(format!("{}.{}", parts[0], parts[1]));
     }
     for label in scopes {
-        let scope = { let db = state.db.lock().unwrap(); sync::scope_profile(&db, &label).ok().map(|(p, schema)| sync::Scope { profile: p.name, schema }) };
+        let scope = { let db = state.db.lock().unwrap(); sync::scope_profile(&db, &label).ok().map(|(p, schema)| sync::Scope { profile: p.name, schema, display_name: None }) };
         if let Some(scope) = scope { sync::run(state, Some(scope), "cleanup").await; }
     }
     Ok(json!({ "dropped": dropped, "failed": failed }))

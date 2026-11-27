@@ -23,11 +23,12 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/sync", post(run_sync))
         .route("/api/sync/status", get(sync_status))
         .route("/api/sync/runs", get(sync_runs))
-        .route("/api/objects", get(objects))
+        .route("/api/objects", get(objects).post(ordered_objects))
         .route("/api/object", get(biz::object))
         .route("/api/comment-sql", get(biz::comments))
         .route("/api/sql-template", get(biz::sql_template))
         .route("/api/sample", post(biz::sample))
+        .route("/api/table-samples", post(biz::table_samples))
         .route("/api/freshness", post(biz::refresh_freshness))
         .route("/api/rename", post(biz::rename))
         .route("/api/comment-conflict", post(biz::resolve_comment))
@@ -49,7 +50,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/export.xlsx", get(transfer::export_xlsx))
         .route("/api/import.xlsx", post(transfer::import_xlsx))
         .route("/api/m/{table}/{pk}", axum::routing::delete(manual::remove))
-        .route("/api/columns", get(columns))
+        .route("/api/columns", get(columns).post(visible_columns))
         .route("/api/todos", get(todos))
         .route("/api/todos/{id}", post(update_todo))
         .route("/api/changes", get(changes))
@@ -127,7 +128,11 @@ async fn put_settings(State(s): St, Json(body): Json<Map<String, Value>>) -> Api
         match key.as_str() {
             "sync_interval_minutes" => if !value.as_u64().is_some_and(|m| (1..=1440).contains(&m)) { return bad("同步间隔需在 1–1440 分钟之间"); },
             "scopes" => match serde_json::from_value::<Vec<Scope>>(value.clone()) {
-                Ok(scopes) if scopes.iter().all(|s| !s.profile.trim().is_empty() && !s.schema.trim().is_empty()) => {}
+                Ok(scopes) if scopes.iter().all(|s| !s.profile.trim().is_empty() && !s.schema.trim().is_empty()) => {
+                    if scopes.iter().any(|s| s.display_name.as_ref().is_some_and(|name| name.trim().chars().count() > 80)) {
+                        return bad("范围显示名称不能超过 80 个字符");
+                    }
+                }
                 _ => return bad("连接和模式不能为空"),
             },
             "freshness_time" => if !valid_time(value) { return bad("时间格式应为 HH:MM"); },
@@ -166,14 +171,39 @@ async fn sync_status(State(s): St) -> ApiResult {
         let label = format!("{}.{}", database.as_deref().unwrap_or(&scope.profile), scope.schema);
         let last = rows(&db, "SELECT * FROM sync_run WHERE scope = ? ORDER BY id DESC LIMIT 1", &[&label])?.pop();
         let counts = rows(&db, "SELECT COUNT(*) AS objects, (SELECT COUNT(*) FROM column_tech c JOIN object_tech o ON o.key = c.object_key WHERE o.scope = ?1 AND c.is_deleted = 0) AS columns FROM object_tech WHERE scope = ?1 AND is_deleted = 0", &[&label])?.pop();
-        scopes.push(json!({ "profile": scope.profile, "schema": scope.schema, "label": label, "connection_found": database.is_some(), "last_run": last, "counts": counts }));
+        let display_name = scope.display_name.as_deref().map(str::trim).filter(|name| !name.is_empty());
+        scopes.push(json!({ "profile": scope.profile, "schema": scope.schema, "label": label, "display_name": display_name, "connection_found": database.is_some(), "last_run": last, "counts": counts }));
     }
     Ok(Json(json!({ "running": running, "interval_minutes": sync::interval_minutes(&db), "scopes": scopes })))
 }
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
-struct ListQuery { q: String, scope: String, kind: String, product: String, layer: String, status: String, key: String, run: Option<i64>, tmp: bool, deleted: bool, page: i64 }
+struct ListQuery { q: String, terms: String, scope: String, kind: String, product: String, layer: String, status: String, key: String, run: Option<i64>, tmp: bool, deleted: bool, page: i64, sort: String }
+
+pub(crate) fn search_terms(text: &str, preset: &str) -> Result<Vec<String>, (StatusCode, String)> {
+    let terms: Vec<String> = if preset.is_empty() { Vec::new() } else {
+        serde_json::from_str(preset).map_err(|_| (StatusCode::BAD_REQUEST, "快筛条件格式无效".into()))?
+    };
+    if terms.len() > 32 { return Err((StatusCode::BAD_REQUEST, "快筛最多包含 32 项搜索条件".into())); }
+    let mut keywords = Vec::new();
+    for keyword in terms.iter().map(String::as_str).chain(std::iter::once(text)).flat_map(str::split_whitespace) {
+        if keywords.iter().any(|saved: &String| saved == keyword) { continue; }
+        if keywords.len() == 64 { return Err((StatusCode::BAD_REQUEST, "搜索关键词不能超过 64 个".into())); }
+        keywords.push(keyword.to_owned());
+    }
+    Ok(keywords)
+}
+
+pub(crate) fn column_search(terms: &[String], args: &mut Vec<Box<dyn ToSql>>) -> String {
+    let mut filter = String::new();
+    for term in terms {
+        args.push(Box::new(like(term)));
+        let n = args.len();
+        filter.push_str(&format!(" AND c.name LIKE ?{n} ESCAPE '\\'"));
+    }
+    filter
+}
 
 async fn sync_runs(State(s): St, Query(q): Query<ListQuery>) -> ApiResult {
     let db = s.db.lock().unwrap();
@@ -181,7 +211,7 @@ async fn sync_runs(State(s): St, Query(q): Query<ListQuery>) -> ApiResult {
 }
 
 /// Shared WHERE for object / column lists. `alias` is the object_tech alias.
-fn object_filters(q: &ListQuery, alias: &str, args: &mut Vec<Box<dyn ToSql>>) -> String {
+fn object_filters(q: &ListQuery, alias: &str, hidden: &[String], args: &mut Vec<Box<dyn ToSql>>) -> String {
     let mut sql = String::new();
     if !q.deleted { sql.push_str(&format!(" AND {alias}.is_deleted = 0")); }
     if !q.tmp { sql.push_str(&format!(" AND NOT {alias}.{TMP}")); }
@@ -192,41 +222,103 @@ fn object_filters(q: &ListQuery, alias: &str, args: &mut Vec<Box<dyn ToSql>>) ->
         args.push(Box::new(value.clone()));
         sql.push_str(&format!(" AND COALESCE((SELECT {field} FROM object_biz WHERE key = {alias}.key), json_extract({alias}.naming, '$.{field}')) = ?{}", args.len()));
     }
+    if !hidden.is_empty() {
+        args.push(Box::new(json!(hidden).to_string()));
+        sql.push_str(&format!(" AND {alias}.key NOT IN (SELECT value FROM json_each(?{}))", args.len()));
+    }
     sql
 }
 
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct CatalogView { order: Vec<String>, hidden: Vec<String>, bottom: Vec<String> }
+
+impl CatalogView {
+    fn validate(&self) -> Result<(), (StatusCode, String)> {
+        for (keys, message) in [(&self.order, "对象排序列表过长"), (&self.hidden, "隐藏对象列表过长"), (&self.bottom, "移到底部的对象列表过长")] {
+            if keys.len() > 50_000 || keys.iter().map(String::len).sum::<usize>() > 4_000_000 {
+                return Err((StatusCode::BAD_REQUEST, message.into()));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CatalogBody { Order(Vec<String>), View(CatalogView) }
+
 async fn objects(State(s): St, Query(q): Query<ListQuery>) -> ApiResult {
+    object_page(&s, q, &CatalogView::default())
+}
+
+async fn ordered_objects(State(s): St, Query(q): Query<ListQuery>, Json(body): Json<CatalogBody>) -> ApiResult {
+    let view = match body { CatalogBody::Order(order) => CatalogView { order, ..Default::default() }, CatalogBody::View(view) => view };
+    view.validate()?;
+    object_page(&s, q, &view)
+}
+
+fn object_page(s: &AppState, q: ListQuery, view: &CatalogView) -> ApiResult {
     let mut args: Vec<Box<dyn ToSql>> = Vec::new();
-    let mut filter = object_filters(&q, "o", &mut args);
-    let mut order = "o.name".to_owned();
-    if !q.q.trim().is_empty() {
-        args.push(Box::new(like(&q.q)));
+    let mut filter = object_filters(&q, "o", &view.hidden, &mut args);
+    let sort = match q.sort.as_str() {
+        "name-asc" => Some("o.name, o.key"),
+        "name-desc" => Some("o.name DESC, o.key"),
+        "columns-desc" => Some("column_count DESC, o.name, o.key"),
+        "rows-desc" => Some("NULLIF(COALESCE(json_extract(o.props, '$.rows'), json_extract(o.props, '$.rows_estimate')), -1) DESC, o.name, o.key"),
+        "size-desc" => Some("json_extract(o.props, '$.size_bytes') DESC, o.name, o.key"),
+        _ => None,
+    };
+    let mut order = sort.unwrap_or("o.name, o.key").to_owned();
+    let terms = search_terms(&q.q, &q.terms)?;
+    for term in &terms {
+        args.push(Box::new(like(term)));
         let n = args.len();
-        filter.push_str(&format!(" AND (o.name LIKE ?{n} ESCAPE '\\' OR o.comment LIKE ?{n} ESCAPE '\\' OR b.cn_name LIKE ?{n} ESCAPE '\\' OR b.description LIKE ?{n} ESCAPE '\\' OR EXISTS (SELECT 1 FROM column_tech c LEFT JOIN column_biz cb ON cb.key = c.key WHERE c.object_key = o.key AND c.is_deleted = 0 AND (c.name LIKE ?{n} ESCAPE '\\' OR c.comment LIKE ?{n} ESCAPE '\\' OR cb.meaning LIKE ?{n} ESCAPE '\\')))"));
-        args.push(Box::new(q.q.trim().to_lowercase()));
-        order = format!("lower(o.name) <> ?{}, o.name LIKE ?{n} ESCAPE '\\' DESC, o.name", args.len());
+        filter.push_str(&format!(" AND o.name LIKE ?{n} ESCAPE '\\'"));
+    }
+    if sort.is_none() && let Some(term) = terms.last() {
+        let n = args.len();
+        args.push(Box::new(term.to_lowercase()));
+        order = format!("lower(o.name) <> ?{}, o.name LIKE ?{n} ESCAPE '\\' DESC, o.name, o.key", args.len());
+    }
+    if !view.order.is_empty() {
+        args.push(Box::new(json!(view.order).to_string()));
+        // Keep the order in the request. Materialize the key lookup once for all matching rows.
+        order = format!("COALESCE((WITH ranks AS MATERIALIZED (SELECT value, CAST(key AS INTEGER) AS pos FROM json_each(?{})) SELECT pos FROM ranks WHERE value = o.key LIMIT 1), 2147483647), {order}", args.len());
+    }
+    if !view.bottom.is_empty() {
+        args.push(Box::new(json!(view.bottom).to_string()));
+        order = format!("COALESCE((WITH bottom AS MATERIALIZED (SELECT value, CAST(key AS INTEGER) + 1 AS pos FROM json_each(?{})) SELECT pos FROM bottom WHERE value = o.key LIMIT 1), 0), {order}", args.len());
     }
     let refs: Vec<&dyn ToSql> = args.iter().map(|a| a.as_ref()).collect();
     let db = s.db.lock().unwrap();
-    page(&db, "o.key, o.scope, o.name, o.kind, o.comment, o.props, o.naming, o.is_deleted, o.synced_at, b.cn_name, COALESCE(b.layer, json_extract(o.naming, '$.layer')) AS layer, COALESCE(b.product, json_extract(o.naming, '$.product')) AS product, (SELECT COUNT(*) FROM column_tech c WHERE c.object_key = o.key AND c.is_deleted = 0) AS column_count",
+    page(&db, "o.key, o.scope, o.name, o.kind, o.comment, o.props, o.naming, o.is_deleted, o.synced_at, b.cn_name, b.description, COALESCE(b.layer, json_extract(o.naming, '$.layer')) AS layer, COALESCE(b.product, json_extract(o.naming, '$.product')) AS product, (SELECT COUNT(*) FROM column_tech c WHERE c.object_key = o.key AND c.is_deleted = 0) AS column_count",
         &format!("FROM object_tech o LEFT JOIN object_biz b ON b.key = o.key WHERE 1 = 1{filter}"), &order, &refs, q.page)
 }
 
 async fn columns(State(s): St, Query(q): Query<ListQuery>) -> ApiResult {
+    column_page(&s, q, &[])
+}
+
+async fn visible_columns(State(s): St, Query(q): Query<ListQuery>, Json(view): Json<CatalogView>) -> ApiResult {
+    view.validate()?;
+    column_page(&s, q, &view.hidden)
+}
+
+fn column_page(s: &AppState, q: ListQuery, hidden: &[String]) -> ApiResult {
     let mut args: Vec<Box<dyn ToSql>> = Vec::new();
-    let mut filter = object_filters(&q, "o", &mut args);
+    let mut filter = object_filters(&q, "o", hidden, &mut args);
     if !q.deleted { filter.push_str(" AND c.is_deleted = 0"); }
-    let mut order = "c.name, o.name".to_owned();
-    if !q.q.trim().is_empty() {
-        args.push(Box::new(like(&q.q)));
-        let n = args.len();
-        filter.push_str(&format!(" AND (c.name LIKE ?{n} ESCAPE '\\' OR c.comment LIKE ?{n} ESCAPE '\\' OR cb.meaning LIKE ?{n} ESCAPE '\\' OR EXISTS (SELECT 1 FROM rule r WHERE r.target_key = c.key AND (r.value LIKE ?{n} ESCAPE '\\' OR r.note LIKE ?{n} ESCAPE '\\')))"));
-        args.push(Box::new(q.q.trim().to_lowercase()));
-        order = format!("lower(c.name) <> ?{}, c.name, o.name", args.len());
+    let mut order = "c.name, o.name, c.key".to_owned();
+    let terms = search_terms(&q.q, &q.terms)?;
+    filter.push_str(&column_search(&terms, &mut args));
+    if let Some(term) = terms.last() {
+        args.push(Box::new(term.to_lowercase()));
+        order = format!("lower(c.name) <> ?{}, c.name, o.name, c.key", args.len());
     }
     let refs: Vec<&dyn ToSql> = args.iter().map(|a| a.as_ref()).collect();
     let db = s.db.lock().unwrap();
-    page(&db, "c.key, c.name, c.data_type, c.nullable, c.comment, c.is_deleted, cb.meaning, o.key AS object_key, o.name AS object_name, o.scope, o.kind",
+    page(&db, "c.key, c.name, c.data_type, c.props, c.nullable, c.comment, c.is_deleted, cb.meaning, cb.notes, cb.sample, o.key AS object_key, o.name AS object_name, o.scope, o.kind",
         &format!("FROM column_tech c JOIN object_tech o ON o.key = c.object_key LEFT JOIN column_biz cb ON cb.key = c.key WHERE 1 = 1{filter}"), &order, &refs, q.page)
 }
 
@@ -293,4 +385,61 @@ async fn relation_graph(State(s): St, Query(q): Query<RelationQuery>) -> ApiResu
     let edges: Vec<&Value> = all.iter().filter(|r| depth.contains_key(r["left_key"].as_str().unwrap_or_default()) && depth.contains_key(r["right_key"].as_str().unwrap_or_default())).collect();
     let nodes = lineage::node_info(&db, &depth.into_iter().collect::<Vec<_>>());
     Ok(Json(json!({ "nodes": nodes, "edges": edges })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn catalog_search_filters_before_pagination_and_filters_expanded_fields() {
+        let db = store::open(std::path::Path::new(":memory:")).unwrap();
+        db.execute_batch("
+            WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<24)
+            INSERT INTO object_tech(key,scope,name,kind,first_seen,synced_at)
+            SELECT printf('demo.public.a_%02d',n),'demo.public',printf('a_%02d',n),'table','x','x' FROM seq;
+            INSERT INTO object_tech(key,scope,name,kind,first_seen,synced_at) VALUES
+              ('demo.public.z_target','demo.public','z_target','table','x','x'),
+              ('other.public.z_target','other.public','z_target','table','x','x');
+            INSERT INTO column_tech(key,object_key,name,ordinal,data_type,nullable,first_seen) VALUES
+              ('demo.public.z_target.needle','demo.public.z_target','needle',1,'text',0,'x'),
+              ('demo.public.z_target.extra','demo.public.z_target','extra',2,'text',0,'x'),
+              ('other.public.z_target.needle','other.public.z_target','needle',1,'text',0,'x');
+        ").unwrap();
+        let state = Arc::new(AppState {
+            db: db.into(), sync_lock: Default::default(), sample_lock: Default::default(), schedule_changed: Default::default(), data_dir: Default::default(),
+        });
+        let query = |q: &str, terms: &str| ListQuery {
+            scope: "demo.public".into(), q: q.into(), terms: terms.into(), ..Default::default()
+        };
+        let Json(browse) = object_page(&state, query("", ""), &CatalogView::default()).unwrap();
+        assert_eq!(browse["total"], 25);
+        assert!(browse["rows"].as_array().unwrap().iter().all(|row| row["name"] != "z_target"));
+        let preset = r#"["z_target"]"#;
+        let Json(field_only) = object_page(&state, query("needle", preset), &CatalogView::default()).unwrap();
+        assert_eq!(field_only["total"], 0);
+        let Json(objects) = object_page(&state, query("z_target", ""), &CatalogView {
+            order: vec!["demo.public.a_01".into()], ..Default::default()
+        }).unwrap();
+        assert_eq!(objects["total"], 1);
+        assert_eq!(objects["rows"][0]["key"], "demo.public.z_target");
+        {
+            let db = state.db.lock().unwrap();
+            db.execute("UPDATE object_tech SET comment = 'database comment' WHERE key = 'demo.public.z_target'", []).unwrap();
+            let spec = crate::manual::SPECS.iter().find(|spec| spec.table == "object_biz").unwrap();
+            crate::manual::upsert(&db, spec, json!({"key": "demo.public.z_target", "description": ""}).as_object().unwrap()).unwrap();
+        }
+        let Json(cleared) = object_page(&state, query("z_target", ""), &CatalogView::default()).unwrap();
+        assert_eq!(cleared["rows"][0]["description"], "");
+        assert_eq!(cleared["rows"][0]["comment"], "database comment");
+        let Json(table_only) = column_page(&state, query("z_target", ""), &[]).unwrap();
+        assert_eq!(table_only["total"], 0);
+        let Json(columns) = column_page(&state, query("needle", ""), &[]).unwrap();
+        assert_eq!(columns["total"], 1);
+        let Json(detail) = biz::object(State(state), Query(biz::ObjectQuery {
+            key: "demo.public.z_target".into(), q: "needle".into(), terms: String::new(),
+        })).await.unwrap();
+        assert_eq!(detail["columns"].as_array().unwrap().len(), 1);
+        assert_eq!(detail["columns"][0]["key"], columns["rows"][0]["key"]);
+    }
 }

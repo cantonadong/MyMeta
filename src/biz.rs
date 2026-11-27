@@ -1,8 +1,8 @@
 //! M2: business metadata views, COMMENT ON generation, standard query template, value sampling, data freshness, rename migration.
-use crate::{AppState, api::{ApiResult, fail, rows}, manual, store::NOW, sync};
+use crate::{AppState, api::{ApiResult, column_search, fail, rows, search_terms}, manual, store::NOW, sync};
 use axum::{Json, extract::{Query, State}, http::StatusCode};
 use myquery_core::db::{identifier, literal};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, ToSql};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -13,6 +13,10 @@ fn bad(message: impl Into<String>) -> (StatusCode, String) { (StatusCode::BAD_RE
 #[derive(Deserialize, Default)]
 #[serde(default)]
 pub struct KeyQuery { pub key: String, pub scope: String }
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub struct ObjectQuery { pub key: String, pub q: String, pub terms: String }
 
 const DATE_NAMES: [&str; 12] = ["date", "event_date", "dt", "day", "report_date", "stat_date", "install_date", "created_date", "created_at", "event_time", "timestamp", "time"];
 
@@ -25,11 +29,16 @@ pub fn date_column(db: &Connection, key: &str) -> Option<String> {
     DATE_NAMES.iter().find_map(|name| columns.iter().find(|(c, t)| c == name && (t.contains("date") || t.contains("timestamp"))).map(|(c, _)| c.clone()))
 }
 
-pub async fn object(State(s): St, Query(q): Query<KeyQuery>) -> ApiResult {
+pub async fn object(State(s): St, Query(q): Query<ObjectQuery>) -> ApiResult {
+    let terms = search_terms(&q.q, &q.terms)?;
+    let mut args: Vec<Box<dyn ToSql>> = vec![Box::new(q.key.clone())];
+    let filter = column_search(&terms, &mut args);
+    let active = if terms.is_empty() { "" } else { " AND c.is_deleted = 0" };
+    let refs: Vec<&dyn ToSql> = args.iter().map(|arg| arg.as_ref()).collect();
     let db = s.db.lock().unwrap();
     let object = rows(&db, "SELECT * FROM object_tech WHERE key = ?", &[&q.key])?.pop().ok_or((StatusCode::NOT_FOUND, "对象不存在".into()))?;
     let biz = rows(&db, "SELECT * FROM object_biz WHERE key = ?", &[&q.key])?.pop();
-    let columns = rows(&db, "SELECT c.*, b.meaning, b.unit, b.currency, b.timezone, b.is_sensitive, b.notes, (SELECT COUNT(*) FROM rule r WHERE r.target_key = c.key) AS rule_count FROM column_tech c LEFT JOIN column_biz b ON b.key = c.key WHERE c.object_key = ? ORDER BY c.is_deleted, c.ordinal", &[&q.key])?;
+    let columns = rows(&db, &format!("SELECT c.*, cb.meaning, cb.unit, cb.currency, cb.timezone, cb.is_sensitive, cb.notes, cb.sample, (SELECT COUNT(*) FROM rule r WHERE r.target_key = c.key) AS rule_count FROM column_tech c LEFT JOIN column_biz cb ON cb.key = c.key WHERE c.object_key = ?1{active}{filter} ORDER BY c.is_deleted, c.ordinal"), &refs)?;
     let prefix = format!("{}.", q.key);
     let rules = rows(&db, "SELECT * FROM rule WHERE target_key = ?1 OR substr(target_key, 1, length(?2)) = ?2 ORDER BY target_key, kind, id", &[&q.key, &prefix])?;
     let freshness = rows(&db, &format!("SELECT f.*, f.max_date < date('now', '-1 day') AS delayed, date('now', '-1 day') AS expected FROM freshness f WHERE key = ?"), &[&q.key])?.pop();
@@ -139,6 +148,65 @@ pub async fn sample(State(s): St, Json(body): Json<SampleBody>) -> ApiResult {
     Ok(Json(json!(values)))
 }
 
+#[derive(Deserialize)]
+pub struct TableSampleQuery {
+    key: String,
+    #[serde(default)]
+    skip_recent: bool,
+}
+
+fn recent_table_sample(db: &Connection, key: &str) -> rusqlite::Result<bool> {
+    db.query_row("SELECT EXISTS(SELECT 1 FROM table_sample_read WHERE key = ? AND read_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-1 month','floor'))",
+        [key], |row| row.get(0))
+}
+
+pub async fn table_samples(State(s): St, Json(body): Json<TableSampleQuery>) -> ApiResult {
+    let _reading = s.sample_lock.read().await;
+    let (name, date, fields) = {
+        let db = s.db.lock().unwrap();
+        if body.skip_recent && recent_table_sample(&db, &body.key).map_err(fail)? {
+            return Ok(Json(json!({ "updated": 0, "skipped": true })));
+        }
+        let name: String = db.query_row("SELECT name FROM object_tech WHERE key = ? AND is_deleted = 0", [&body.key], |r| r.get(0))
+            .optional().map_err(fail)?.ok_or((StatusCode::NOT_FOUND, "对象不存在".into()))?;
+        let fields = rows(&db, "SELECT c.key, c.name, b.sample FROM column_tech c LEFT JOIN column_biz b ON b.key = c.key
+            WHERE c.object_key = ? AND c.is_deleted = 0 AND COALESCE(b.is_sensitive, 0) = 0 ORDER BY c.ordinal", &[&body.key])?;
+        let date = date_column(&db, &body.key).filter(|name| fields.iter().any(|field| field["name"].as_str() == Some(name.as_str())));
+        (name, date, fields)
+    };
+    if fields.is_empty() { return Ok(Json(json!({ "updated": 0 }))); }
+    let (session, _, schema) = sync::connect_key(&s, &body.key).await.map_err(bad)?;
+    let projection = fields.iter().map(|field| identifier(field["name"].as_str().unwrap())).collect::<Vec<_>>().join(", ");
+    let order = date.map(|column| format!(" ORDER BY {} DESC NULLS LAST", identifier(&column))).unwrap_or_default();
+    let sql = format!("SELECT {projection} FROM {}.{}{order} LIMIT 1", identifier(&schema), identifier(&name));
+    session.client.simple_query("SET statement_timeout TO 60000").await.map_err(|e| bad(myquery_core::db::error(e)))?;
+    let data = session.client.simple_query(&sql).await.map_err(|e| bad(myquery_core::db::error(e)))?
+        .into_iter().find_map(|message| match message { tokio_postgres::SimpleQueryMessage::Row(row) => Some(row), _ => None });
+    // ponytail: sample text follows the 500-character preview limit, increase it if full values are needed.
+    let values = data.iter().flat_map(|row| (0..row.len()).map(|i| row.get(i).map(|text| text.chars().take(500).collect::<String>())));
+    let updated = save_table_samples(&mut s.db.lock().unwrap(), &body.key, &fields, values)?;
+    Ok(Json(json!({ "updated": updated })))
+}
+
+fn save_table_samples(db: &mut Connection, object: &str, fields: &[Value], values: impl IntoIterator<Item = Option<String>>) -> Result<usize, (StatusCode, String)> {
+    let spec = manual::SPECS.iter().find(|s| s.table == "column_biz").unwrap();
+    let tx = db.transaction().map_err(fail)?;
+    let mut updated = 0;
+    for (field, value) in fields.iter().zip(values) {
+        let key = field["key"].as_str().unwrap();
+        let current: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM column_tech c LEFT JOIN column_biz b ON b.key = c.key
+            WHERE c.key = ?1 AND c.object_key = ?2 AND c.is_deleted = 0 AND COALESCE(b.is_sensitive, 0) = 0 AND b.sample IS ?3)",
+            (key, object, field["sample"].as_str()), |r| r.get(0)).map_err(fail)?;
+        if !current || field["sample"].as_str() == value.as_deref() { continue; }
+        manual::upsert(&tx, spec, json!({ "key": key, "sample": value }).as_object().unwrap()).map_err(fail)?;
+        updated += 1;
+    }
+    tx.execute(&format!("INSERT INTO table_sample_read (key, read_at) VALUES (?, {NOW})
+        ON CONFLICT(key) DO UPDATE SET read_at = excluded.read_at"), [object]).map_err(fail)?;
+    tx.commit().map_err(fail)?;
+    Ok(updated)
+}
+
 /// MAX(date column) for one object; stores the result (or error) in `freshness`.
 pub async fn check_freshness(state: &AppState, session: &myquery_core::db::Session, key: &str) -> Result<(), String> {
     let column = { let db = state.db.lock().unwrap(); date_column(&db, key) };
@@ -237,6 +305,39 @@ pub fn layers(db: &Connection) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refreshing_samples_preserves_manual_metadata_and_skips_concurrent_changes() {
+        let mut db = crate::store::open(std::path::Path::new(":memory:")).unwrap();
+        db.execute_batch("
+            INSERT INTO column_tech(key, object_key, name, ordinal, data_type, nullable, first_seen) VALUES
+                ('d.s.events.a','d.s.events','a',1,'text',1,'x'),
+                ('d.s.events.b','d.s.events','b',2,'text',1,'x'),
+                ('d.s.events.c','d.s.events','c',3,'text',1,'x');
+            INSERT INTO column_biz(key, meaning, sample, is_sensitive) VALUES
+                ('d.s.events.a','metadata','old',0), ('d.s.events.b',NULL,'new manual value',0),
+                ('d.s.events.c',NULL,'private',1);
+        ").unwrap();
+        let fields = [
+            json!({"key":"d.s.events.a","sample":"old"}),
+            json!({"key":"d.s.events.b","sample":"old"}),
+            json!({"key":"d.s.events.c","sample":"private"}),
+        ];
+        assert_eq!(save_table_samples(&mut db, "d.s.events", &fields, [Some("latest".into()), None, None]).unwrap(), 1);
+        let samples = rows(&db, "SELECT meaning, sample FROM column_biz ORDER BY key", &[]).unwrap();
+        assert_eq!(samples[0]["sample"], "latest");
+        assert_eq!(samples[0]["meaning"], "metadata");
+        assert_eq!(samples[1]["sample"], "new manual value");
+        assert_eq!(samples[2]["sample"], "private");
+        assert!(recent_table_sample(&db, "d.s.events").unwrap());
+        assert!(!recent_table_sample(&db, "d.s.other").unwrap());
+        db.execute("UPDATE table_sample_read SET read_at = strftime('%Y-%m-%dT%H:%M:%SZ','now','-10 days')", []).unwrap();
+        assert!(recent_table_sample(&db, "d.s.events").unwrap());
+        db.execute("UPDATE table_sample_read SET read_at = strftime('%Y-%m-%dT%H:%M:%SZ','now','-32 days')", []).unwrap();
+        assert!(!recent_table_sample(&db, "d.s.events").unwrap());
+        assert_eq!(save_table_samples(&mut db, "d.s.events", &[json!({"key":"d.s.events.a","sample":"latest"})], [Some("latest".into())]).unwrap(), 0);
+        assert!(recent_table_sample(&db, "d.s.events").unwrap());
+    }
 
     #[test]
     fn rename_moves_manual_content() {
